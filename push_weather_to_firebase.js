@@ -2,98 +2,99 @@ const { spawn } = require('child_process');
 const readline = require('readline');
 const admin = require('firebase-admin');
 const serviceAccount = require('./serviceAccountKey.json');
+const crypto = require('crypto');
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
 const db = admin.firestore();
-
 const rtl433 = spawn('rtl_433', ['-F', 'json']);
+const rl = readline.createInterface({ input: rtl433.stdout });
+
 rtl433.stderr.on('data', (data) => {
   console.error(`rtl_433 error: ${data}`);
 });
 
-const rl = readline.createInterface({ input: rtl433.stdout });
+const cache = {};
+let lastHash = null;
+let lastSent = null;
+let sendsToday = 0;
 
-let lastWritten = null;
-let lastWriteTime = 0;
-let dailyWriteCount = 0;
+const MAX_SENDS = 20;
+const MIN_INTERVAL_MS = 1000 * 60 * 60 * 3; // every 3 hrs = 8/day
 
-// Cached fields to persist non-null values
-let lastHumidity = null;
-let lastWindSpeed = null;
-let lastWindDir = null;
+const hashData = (obj) => {
+  const str = JSON.stringify(obj);
+  return crypto.createHash('sha1').update(str).digest('hex');
+};
 
-function hasSignificantChange(current, previous) {
-  if (!previous) return true;
-
-  const deltaTemp = Math.abs(current.temperature - previous.temperature);
-  const deltaWind = Math.abs(current.windSpeed - previous.windSpeed);
-  const deltaDir = Math.abs(current.windDir - previous.windDir);
-
-  return (
-    deltaTemp >= 0.5 ||
-    deltaWind >= 0.5 ||
-    deltaDir >= 10
-  );
-}
-
-function isOn3HourSchedule() {
-  const now = new Date();
-  return now.getMinutes() === 0 && [1, 4, 7, 10, 13, 16, 19, 22].includes(now.getHours());
-}
-
-function shouldWrite(currentData) {
+const shouldSend = (data) => {
   const now = Date.now();
 
-  const nowDate = new Date().toISOString().split('T')[0];
-  const lastDate = new Date(lastWriteTime).toISOString().split('T')[0];
-  if (nowDate !== lastDate) {
-    dailyWriteCount = 0;
+  // check count
+  const today = new Date().toISOString().split("T")[0];
+  if (lastSent && lastSent.date !== today) {
+    sendsToday = 0; // reset daily counter
   }
 
-  if (dailyWriteCount >= 20) return false;
+  const thisHash = hashData(data);
 
-  const scheduled = isOn3HourSchedule();
-  const changed = hasSignificantChange(currentData, lastWritten);
+  const isDifferent = thisHash !== lastHash;
+  const isMinTimePassed = !lastSent || now - lastSent.timestamp >= MIN_INTERVAL_MS;
 
-  return scheduled || changed;
-}
+  if ((isDifferent && sendsToday < MAX_SENDS) || isMinTimePassed) {
+    lastHash = thisHash;
+    lastSent = { timestamp: now, date: today };
+    sendsToday++;
+    return true;
+  }
 
-rl.on('line', async (line) => {
+  return false;
+};
+
+const saveToFirebase = async (id) => {
+  const entry = cache[id];
+  if (!entry || !entry.temperature_F || !entry.rain_in) return;
+
+  if (!shouldSend(entry)) {
+    console.log("🟡 Skipped: no change or rate limited.");
+    return;
+  }
+
+  try {
+    await db.collection('weather_logs').add({
+      timestamp: new Date(entry.time),
+      temperature: entry.temperature_F ?? null,
+      humidity: entry.humidity ?? null,
+      windSpeed: entry.wind_avg_km_h ?? null,
+      windDirection: entry.wind_dir_deg ?? null,
+      rainfall: entry.rain_in ?? null,
+      battery_ok: entry.battery_ok ?? null,
+      model: entry.model ?? 'Unknown',
+      sensor_id: id
+    });
+
+    console.log("✅ Logged to Firebase:", entry);
+    delete cache[id];
+  } catch (err) {
+    console.error("❌ Upload failed:", err);
+  }
+};
+
+rl.on('line', (line) => {
   try {
     const data = JSON.parse(line);
+    if (data.model !== "Acurite-5n1") return;
 
-    if (data.model === "LaCrosse-TX141Bv3") {
-      // Update cached values if present
-      if (data.humidity != null) lastHumidity = data.humidity;
-      if (data.windSpeed != null) lastWindSpeed = data.windSpeed;
-      if (data.wind_dir_deg != null) lastWindDir = data.wind_dir_deg;
+    const id = data.id;
+    if (!cache[id]) cache[id] = { ...data };
+    else cache[id] = { ...cache[id], ...data };
 
-      const weatherData = {
-        timestamp: new Date(data.time),
-        temperature: data.temperature_C ?? null,
-        humidity: lastHumidity,
-        windSpeed: lastWindSpeed,
-        windDir: lastWindDir,
-        battery_ok: data.battery_ok ?? null,
-        sensor_id: data.id ?? null,
-        model: data.model
-      };
-
-      if (shouldWrite(weatherData)) {
-        await db.collection('weather_logs').add(weatherData);
-        lastWritten = weatherData;
-        lastWriteTime = Date.now();
-        dailyWriteCount++;
-        console.log("✅ Logged to Firebase:", weatherData);
-      } else {
-        console.log("⏭️ Skipped (no significant change or outside schedule)");
-      }
+    if ('temperature_F' in cache[id] && 'rain_in' in cache[id]) {
+      saveToFirebase(id);
     }
-
   } catch (err) {
-    console.error("❌ Error parsing or uploading:", err);
+    console.warn("⚠️ Malformed JSON skipped");
   }
 });
