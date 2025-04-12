@@ -24,6 +24,25 @@ let sendsToday = 0;
 const MAX_SENDS = 20;
 const MIN_INTERVAL_MS = 1000 * 60 * 60 * 3; // every 3 hrs = 8/day
 
+const thresholds = {
+  temperature_F: 1,
+  humidity: 5,
+  wind_avg_km_h: 2,
+  wind_dir_deg: 15,
+  rain_in: .05
+},
+
+const isSignificantlyDifferent = (a,b) => {
+  if (!a || !b) return true;
+
+  for (const k of Object.keys(threshholds)) {
+    const delta = Math.abs((a[key] ?? 0 ) - (b[key] ?? 0));
+    if (delta > thresholds[key]) return true;
+  }
+
+  return false;
+};
+
 const hashData = (obj) => {
   const str = JSON.stringify(obj);
   return crypto.createHash('sha1').update(str).digest('hex');
@@ -40,10 +59,10 @@ const shouldSend = (data) => {
 
   const thisHash = hashData(data);
 
-  const isDifferent = thisHash !== lastHash;
+  const significantChange =  isSignificantlyDifferent(thisHash, lastHash);
   const isMinTimePassed = !lastSent || now - lastSent.timestamp >= MIN_INTERVAL_MS;
 
-  if ((isDifferent && sendsToday < MAX_SENDS) || isMinTimePassed) {
+  if ((signigicantChange && sendsToday < MAX_SENDS) || isMinTimePassed) {
     lastHash = thisHash;
     lastSent = { timestamp: now, date: today };
     sendsToday++;
